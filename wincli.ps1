@@ -24,9 +24,9 @@ Set-StrictMode -Version Latest
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $ErrorActionPreference = "Stop"
 
-# Daily log file e.g. %TEMP%\wincli_log\wincli_data_20250624.txt
+# Daily log file e.g. %LOCALAPPDATA%\WinCLI\Logs\wincli_YYYYMMDD.txt
 $WinCliDate  = Get-Date -Format "yyyyMMdd"
-$LogRoot     = Join-Path $env:TEMP "wincli_log"
+$LogRoot     = Join-Path $env:LOCALAPPDATA "WinCLI\Logs"
 $LogFilePath = Join-Path $LogRoot "wincli_${WinCliDate}.txt"
 
 # Ensure folder & file exist
@@ -36,7 +36,6 @@ if (-not (Test-Path -LiteralPath $LogRoot)) {
 if (-not (Test-Path -LiteralPath $LogFilePath)) {
     New-Item -Path $LogFilePath -ItemType File -Force | Out-Null
 }
-
 $Global:WinCli = @{
     Version = "v1-20250624"
     LogPath = $LogFilePath
@@ -168,6 +167,7 @@ function Show-SystemManagementMenu {
         Write-Host ""
         Write-Host "[1] System information" -ForegroundColor Yellow
         Write-Host "[2] Windows Update" -ForegroundColor Yellow
+        Write-Host "[3] Storage / Cleanup" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "[B] Back" -ForegroundColor Yellow
         Write-Host ""
@@ -181,6 +181,10 @@ function Show-SystemManagementMenu {
             "2" {
                 Write-Log -Message "User selected Windows Update" -Level "INFO"
                 Invoke-WindowsUpdateInteractive
+            }
+            "3" {
+                Write-Log -Message "User selected Storage / Cleanup" -Level "INFO"
+                Invoke-StorageCleanup
             }
             "B" {
                 Write-Log -Message "User returned to main menu" -Level "INFO"
@@ -300,6 +304,7 @@ function Show-MainMenu {
         Write-Host ""
         Write-Host "[1] System Management" -ForegroundColor Yellow
         Write-Host ""
+        Write-Host "[L] Open log file" -ForegroundColor Yellow
         Write-Host "[Q] Exit" -ForegroundColor Yellow
         Write-Host ""
 
@@ -308,6 +313,11 @@ function Show-MainMenu {
             "1" {
                 Write-Log -Message "User entered System Management menu" -Level "INFO"
                 Show-SystemManagementMenu
+            }
+            "L" {
+                Start-Process notepad.exe -ArgumentList $Global:WinCli.LogPath
+                Write-Log -Message "User opended log file" -Level "INFO"
+                Show-MainMenu
             }
             "Q" {
                 Write-Log -Message "User exited WinCLI" -Level "INFO"
@@ -434,6 +444,241 @@ function Invoke-WindowsUpdateInteractive {
     }
 
     Pause "Press any key to return..." | Out-Null
+}
+
+function Invoke-StorageCleanup {
+<#
+.SYNOPSIS
+    Prints a “before–cleanup” snapshot (total / used / free of the system
+    drive + size of the main junk areas).  
+    Later you can extend the function with actual deletion steps.
+
+.PARAMETER AnalyzeOnly
+    Show the snapshot and exit without deleting anything.
+
+.PARAMETER Aggressive
+    Placeholder for heavy-duty steps (WinSxS / DriverStore / CompactOS).
+
+.PARAMETER Silent
+    Suppress Pause / Read-Host prompts; log only.
+
+.NOTES
+    Designed to drop into wincli.ps1 (uses Write-Log & colour scheme).
+#>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [switch] $AnalyzeOnly,
+        [switch] $Aggressive,
+        [switch] $Silent
+    )
+
+    function Pause {
+        param([string]$Message = "Press any key to continue...")
+        Read-Host $Message | Out-Null
+    }
+
+    # ───────────────── helpers ────────────────────────────────────────────
+    function ConvertTo-Readable {
+        param([UInt64]$Bytes)
+        switch ($Bytes) {
+            { $_ -ge 1TB * 1024 } { return '{0:N2} PB' -f ($Bytes / (1TB * 1024)) }
+            { $_ -ge 1TB }        { return '{0:N2} TB' -f ($Bytes / 1TB) }
+            { $_ -ge 1GB }        { return '{0:N2} GB' -f ($Bytes / 1GB) }
+            { $_ -ge 1MB }        { return '{0:N2} MB' -f ($Bytes / 1MB) }
+            { $_ -ge 1KB }        { return '{0:N2} KB' -f ($Bytes / 1KB) }
+            default               { return "$Bytes B" }
+        }
+    }
+
+    function Get-FolderSize {
+        param([string]$Path)
+        if (-not (Test-Path -LiteralPath $Path)) { return 0 }
+        try {
+            (Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+             Measure-Object Length -Sum).Sum
+        } catch { 0 }
+    }
+
+    # ───────────────── STEP 0 – snapshot ─────────────────────────────────
+    Clear-Host
+    Show-Banner
+    Write-Host "STORAGE CLEANUP`n" -ForegroundColor Yellow
+    Write-Log  "Storage snapshot started" "INFO"
+
+    $sysRoot  = [IO.Path]::GetPathRoot($env:SystemRoot)
+    $sysDrive = $sysRoot.TrimEnd('\')
+
+    $driveInfo = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$sysDrive'" |
+                  Select-Object -First 1)
+
+    $total   = [UInt64]$driveInfo.Size
+    $free    = [UInt64]$driveInfo.FreeSpace
+    $used    = $total - $free
+    $pctFree = [math]::Round(($free / $total)*100,1)
+
+    Write-Host ("Drive {0}:  Total {1}   Used {2}   Free {3} ({4}%)" -f 
+        $sysDrive,
+        (ConvertTo-Readable $total),
+        (ConvertTo-Readable $used),
+        (ConvertTo-Readable $free),
+        $pctFree) -ForegroundColor Cyan
+
+    $targets = [ordered]@{
+        'Restore points'        = 0
+        'WinSxS'                = "$env:SystemRoot\WinSxS"
+        'User Temp'             = $env:TEMP
+        'System Temp'           = "$env:SystemRoot\Temp"
+        'Recycle Bin'           = Join-Path $sysDrive '$Recycle.Bin'
+        'WU cache'              = "$env:SystemRoot\SoftwareDistribution\Download"
+        'Delivery Optimization' = "$env:SystemRoot\SoftwareDistribution\DeliveryOptimization"
+        'Old logs (>30 d)'      = "$env:SystemRoot\Logs"
+    }
+
+    try {
+        $shadow = Get-CimInstance Win32_ShadowStorage -ErrorAction Stop |
+                  Where-Object { $_.PSObject.Properties['VolumeName'] -and
+                                 $_.VolumeName -eq $sysRoot }
+        if ($shadow) { $targets['Restore points'] = [UInt64]$shadow.UsedSpace }
+    } catch { }
+
+    try {
+        $targets['Old logs (>30 d)'] = (
+            Get-ChildItem -LiteralPath $targets['Old logs (>30 d)'] -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+            Measure-Object Length -Sum
+        ).Sum
+    } catch { $targets['Old logs (>30 d)'] = 0 }
+
+    $keyList = @($targets.Keys)
+    foreach ($k in $keyList) {
+        if ($k -match 'Restore points|Old logs') { continue }
+        $targets[$k] = Get-FolderSize $targets[$k]
+    }
+
+    Write-Host ''
+    foreach ($pair in $targets.GetEnumerator()) {
+        $nice = ConvertTo-Readable $pair.Value
+        Write-Host ("{0,-25} {1,12}" -f ($pair.Key + ':'), $nice)
+    }
+    Write-Host ''
+
+    if ($AnalyzeOnly) {
+        Write-Log "AnalyzeOnly – no cleanup executed" "INFO"
+        if (-not $Silent) { Pause }
+        return
+    }
+
+    # ─────────────── future cleanup steps go here ─────────────────────────
+    # e.g. Clear-RecycleBin, Remove-Item temp, DISM cleanup, etc.
+    # ────── Prompt user for cleanup decisions ──────
+    $cleanupDecisions = @{}
+
+    foreach ($pair in $targets.GetEnumerator()) {
+        $areaName = $pair.Key
+        $sizeReadable = ConvertTo-Readable $pair.Value
+
+        if ($pair.Value -eq 0) {
+            $cleanupDecisions[$areaName] = $false
+            continue
+        }
+
+        $response = Read-Host "Do you want to clean '$areaName' (${sizeReadable})? (y/n)"
+        $cleanupDecisions[$areaName] = $response -match '^[Yy]'
+    }
+
+    # ────── Final summary of selected options ──────
+    Write-Host "`nCleanup selections:" -ForegroundColor Yellow
+    foreach ($key in $cleanupDecisions.Keys) {
+        $action = if ($cleanupDecisions[$key]) { "Yes" } else { "No" }
+        Write-Host ("{0,-25} {1}" -f ($key + ':'), $action)
+    }
+    Write-Host ''
+
+# ────── Cleanup execution based on selection ──────
+Write-Host "`nStarting cleanup..." -ForegroundColor Green
+Write-Log "Cleanup process started" "INFO"
+
+foreach ($key in $cleanupDecisions.Keys) {
+    if (-not $cleanupDecisions[$key]) {
+        Write-Log "Skipped: $key (user chose No)" "INFO"
+        continue
+    }
+
+    Write-Host ("Cleaning: {0}..." -f $key) -ForegroundColor Cyan
+    Write-Log "Cleaning started: $key" "INFO"
+
+    try {
+        switch ($key) {
+
+            'Restore points' {
+                Write-Host "Skipping: Restore points require advanced handling (use vssadmin or Cleanmgr)." -ForegroundColor DarkYellow
+                Write-Log "Restore points skipped – not supported via script" "WARN"
+            }
+
+            'WinSxS' {
+                Ensure-RunningAsAdministrator
+                Write-Host "Cleaning WinSxS with DISM..."
+                Write-Log "DISM StartComponentCleanup initiated" "INFO"
+                Start-Process -Wait -FilePath "dism.exe" -ArgumentList "/Online", "/Cleanup-Image", "/StartComponentCleanup", "/Quiet" -NoNewWindow
+                Write-Log "DISM cleanup finished for WinSxS" "INFO"
+            }
+
+            'User Temp' {
+                Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "User Temp cleaned."
+                Write-Log "User Temp cleaned" "INFO"
+            }
+
+            'System Temp' {
+                Remove-Item -Path "$env:SystemRoot\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "System Temp cleaned."
+                Write-Log "System Temp cleaned" "INFO"
+            }
+
+            'Recycle Bin' {
+                Write-Host "Emptying Recycle Bin..."
+                Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+                Write-Log "Recycle Bin emptied" "INFO"
+            }
+
+            'WU cache' {
+                Remove-Item -Path "$env:SystemRoot\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "Windows Update cache cleaned."
+                Write-Log "Windows Update cache cleaned" "INFO"
+            }
+
+            'Delivery Optimization' {
+                Remove-Item -Path "$env:SystemRoot\SoftwareDistribution\DeliveryOptimization\*" -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "Delivery Optimization cache cleaned."
+                Write-Log "Delivery Optimization cache cleaned" "INFO"
+            }
+
+            'Old logs (>30 d)' {
+                $logPath = "$env:SystemRoot\Logs"
+                $oldLogs = Get-ChildItem -Path $logPath -Recurse -Force -ErrorAction SilentlyContinue |
+                           Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) }
+
+                $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue
+                Write-Host "Old logs removed."
+                Write-Log "Old logs (older than 30 days) removed" "INFO"
+            }
+
+            default {
+                Write-Host "No cleanup routine defined for: $key" -ForegroundColor DarkGray
+                Write-Log "No defined cleanup for $key" "WARN"
+            }
+        }
+    } catch {
+        Write-Host "Error while cleaning $key\: $_" -ForegroundColor Red
+        Write-Log "Error while cleaning $key\: $_" "ERROR"
+    }
+}
+
+Write-Host "`nCleanup process completed." -ForegroundColor Green
+Write-Log "Cleanup process completed" "INFO"
+
+
+    if (-not $Silent) { Pause "Press any key to finish..." }
 }
 
 #endregion Helper Functions
