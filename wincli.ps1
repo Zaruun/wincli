@@ -7,6 +7,7 @@
 
   One‑liner launch after publishing to GitHub:
       irm https://raw.githubusercontent.com/Zaruun/wincli/refs/heads/main/wincli.ps1 | iex
+      irm mmucha.pl/wincli | iex
 
 .VERSION
   v1-20250624
@@ -148,7 +149,8 @@ function Show-Banner {
 "@
     Write-Host $banner -ForegroundColor Cyan
     Write-Host ("WinCLI " + $Global:WinCli.Version) -ForegroundColor Cyan
-    Write-Host ('-' * 40) -ForegroundColor Cyan
+    Write-Host ('-' * 85) -ForegroundColor Cyan
+    Write-Host ""
 }
 
 function Initialize-WinCli {
@@ -168,6 +170,7 @@ function Show-SystemManagementMenu {
         Write-Host "[2] Windows Update" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "[B] Back" -ForegroundColor Yellow
+        Write-Host ""
 
         $subChoice = Read-Host "Select an option"
         switch ($subChoice.ToUpper()) {
@@ -177,7 +180,7 @@ function Show-SystemManagementMenu {
             }
             "2" {
                 Write-Log -Message "User selected Windows Update" -Level "INFO"
-                Ensure-RunningAsAdministrator
+                Invoke-WindowsUpdateInteractive
             }
             "B" {
                 Write-Log -Message "User returned to main menu" -Level "INFO"
@@ -298,6 +301,7 @@ function Show-MainMenu {
         Write-Host "[1] System Management" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "[Q] Exit" -ForegroundColor Yellow
+        Write-Host ""
 
         $choice = Read-Host "Select an option"
         switch ($choice.ToUpper()) {
@@ -316,6 +320,122 @@ function Show-MainMenu {
         }
     } while ($true)
 }
+
+function Invoke-WindowsUpdateInteractive {
+<#
+.SYNOPSIS
+    Searches for pending Windows Updates and, if any are found,
+    asks the user whether to download & install them.
+
+.DESCRIPTION
+    • Ensures the session is running elevated (calls Ensure-RunningAsAdministrator).
+    • Uses the Microsoft Update COM API – no external modules required.
+    • Logs every major step with Write-Log, mirrors status to the console.
+    • After installation informs the user if a reboot is required.
+
+.NOTES
+    Fits the coding style of wincli.ps1 (logging, colours, Pause, etc.).
+#>
+    [CmdletBinding()]
+    param()
+
+    Clear-Host
+    Show-Banner
+    Write-Host "WINDOWS UPDATES`n" -ForegroundColor Yellow
+
+    # -- make sure we are running as Administrator --------------------------
+    $isAdmin = ([Security.Principal.WindowsPrincipal] `
+               [Security.Principal.WindowsIdentity]::GetCurrent()
+               ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    if (-not $isAdmin) {
+        if (-not (Ensure-RunningAsAdministrator)) { return }   # user declined
+        return                                                # new elevated session will relaunch the script
+    }
+
+    try {
+        Write-Host "Checking for available Windows Updates..." -ForegroundColor Yellow
+        Write-Log  "Checking for Windows Updates" "INFO"
+
+        # ---------- search --------------------------------------------------
+        $session     = New-Object -ComObject Microsoft.Update.Session
+        $searcher    = $session.CreateUpdateSearcher()
+        $criteria    = "IsInstalled=0 and IsHidden=0"
+        $searchResult = $searcher.Search($criteria)
+        $updates      = $searchResult.Updates
+        $count        = $updates.Count
+
+        if ($count -eq 0) {
+            Write-Host "No updates available." -ForegroundColor Green
+            Write-Log  "No updates found" "INFO"
+            Pause "Press any key to return..." | Out-Null
+            return
+        }
+
+        # ---------- list updates -------------------------------------------
+        Write-Host ""
+        Write-Host "$count update(s) found:" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $count; $i++) {
+            $title = $updates.Item($i).Title
+            Write-Host (" [{0}] {1}" -f ($i + 1), $title)
+        }
+        Write-Host ""
+
+        # ---------- ask user ------------------------------------------------
+        $install = Read-Host "Download and install all updates now? (Y/N)"
+        if ($install -notmatch '^[Yy]') {
+            Write-Log "User declined update installation." "WARNING"
+            return
+        }
+
+        # ---------- download -----------------------------------------------
+        Write-Host "`nDownloading updates…" -ForegroundColor Yellow
+        $downloader            = $session.CreateUpdateDownloader()
+        $downloader.Updates    = $updates
+        $downloadResult        = $downloader.Download()
+
+        if ($downloadResult.ResultCode -ne 2) {   # 2 = Succeeded
+            Write-Error "Download failed (result code $($downloadResult.ResultCode))."
+            Write-Log   "Update download failed, code $($downloadResult.ResultCode)" "ERROR"
+            return
+        }
+
+        # ---------- install -------------------------------------------------
+        Write-Host "`nInstalling updates…" -ForegroundColor Yellow
+        $installer          = $session.CreateUpdateInstaller()
+        $installer.Updates  = $updates
+        $installResult      = $installer.Install()
+        $code               = $installResult.ResultCode
+
+        switch ($code) {
+            2 {   # Succeeded
+                Write-Host "`nUpdates installed successfully." -ForegroundColor Green
+                Write-Log  "Updates installed successfully" "INFO"
+            }
+            3 {   # Succeeded with errors
+                Write-Host "`nUpdates installed with warnings." -ForegroundColor Yellow
+                Write-Log  "Updates installed with warnings" "WARNING"
+            }
+            default {
+                Write-Error "Installation failed or aborted (code $code)."
+                Write-Log   "Update installation ended with code $code" "ERROR"
+                return
+            }
+        }
+
+        if ($installResult.RebootRequired) {
+            Write-Host "A restart is required to complete installation." -ForegroundColor Yellow
+            Write-Log  "Restart required after updates" "INFO"
+        }
+
+    } catch {
+        Write-Error "Windows Update error: $($_.Exception.Message)"
+        Write-Log   "Windows Update error: $($_.Exception.Message)" "ERROR"
+    }
+
+    Pause "Press any key to return..." | Out-Null
+}
+
 #endregion Helper Functions
 
 #region Entry Point
