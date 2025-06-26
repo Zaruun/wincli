@@ -6,7 +6,7 @@
   Each time a menu is entered the console is cleared, the banner is printed, and the relevant options are shown.
 
   One‑liner launch after publishing to GitHub:
-      irm https://raw.githubusercontent.com/<YourRepo>/wincli/main/wincli.ps1 | iex
+      irm https://raw.githubusercontent.com/Zaruun/wincli/refs/heads/main/wincli.ps1 | iex
 
 .VERSION
   v1-20250624
@@ -39,7 +39,7 @@ if (-not (Test-Path -LiteralPath $LogFilePath)) {
 $Global:WinCli = @{
     Version = "v1-20250624"
     LogPath = $LogFilePath
-    GithubRepoScript = ""
+    GithubRepoScript = "https://raw.githubusercontent.com/Zaruun/wincli/refs/heads/main/wincli.ps1"
 }
 #endregion Initialisation
 
@@ -100,21 +100,25 @@ function Ensure-RunningAsAdministrator {
     }
 
     # 3) Build the command that the elevated shell will run
-    $command = "irm $ScriptUrl | iex"
-    if (-not $command) {
+    if ([string]::IsNullOrWhiteSpace($ScriptUrl)) {
         Write-Error 'ScriptUrl is empty – nothing to run in the elevated session.'
         return $false
     }
 
-    # Encode the command so we do not have to escape quotes, pipes, etc.
-    $encoded = [Convert]::ToBase64String(
+    if ($ScriptUrl -notmatch '^https?://') {
+        Write-Error "ScriptUrl must start with http:// or https:// : '$ScriptUrl'"
+        return $false
+    }
+
+    $command  = "irm '$ScriptUrl' | iex"
+
+    $encoded  = [Convert]::ToBase64String(
                    [Text.Encoding]::Unicode.GetBytes($command)
                )
 
     $argLine  = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
     if ($KeepWindowOpen) { $argLine = "-NoExit $argLine" }
 
-    # 4) Start an elevated PowerShell process
     try {
         Start-Process -FilePath  'powershell.exe' `
                       -ArgumentList $argLine `
@@ -126,7 +130,7 @@ function Ensure-RunningAsAdministrator {
         return $false
     }
 
-    Exit  # terminate the non-admin process
+    Exit   # terminate the non-admin process 
 }
 
 
